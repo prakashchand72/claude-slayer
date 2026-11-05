@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"maps"
 	"net"
@@ -867,34 +866,28 @@ func forceCloakResiduals(engDir string, residual []string) int {
 	return cloaked
 }
 
-// cloakOneResidual hides a single surviving value. An IP gets a loopback
-// fiction and a domain a hostname-only mapping (a numeric "localhost:<port>"
-// fiction with no org/email/path derivatives, so it cannot collide with an
-// existing org fiction -- the collision that makes the full mapping fail).
-// Anything else, or a domain whose hostname mapping is still refused, gets a
-// literal custom rule to an opaque fiction that no detector flags.
+// cloakOneResidual hides a single surviving value with a literal custom rule.
+//
+// Two things make the fiction right. It is a "localhost:<port>" value from the
+// engagement's own port counter: isOwnFiction reads the first label of every
+// tanuki fiction as "localhost", so the cloaked value is recognised as tanuki's
+// own and is not re-flagged when it comes back in the next request's history --
+// a ".local" fiction was read as a fresh real target and re-cloaked forever
+// until the pass bound refused the body. And a custom rule matches anywhere
+// (boundNone), so it replaces the value even when it is glued to other text --
+// a domain wedged inside a filename like "F52_api.target.de_report", which a
+// host-bounded mapping refuses to touch.
 func cloakOneResidual(engDir, v string) bool {
-	if net.ParseIP(v) != nil {
-		if err := addIPMapping(engDir, v); err != nil {
-			logger.Warn("could not cloak a residual IP", "value", v, "error", err)
+	port, err := allocatePort(engDir, "cloak residual")
+	if err != nil {
+		logger.Warn("could not allocate a cloak fiction", "value", v, "error", err)
 
-			return false
-		}
-
-		logger.Info("cloaked a residual value", "value", v)
-
-		return true
+		return false
 	}
 
-	if _, err := registrableName(v); err == nil {
-		if err := addHostOnlyDomain(engDir, v); err == nil {
-			logger.Info("cloaked a residual value", "value", v)
+	fiction := fmt.Sprintf("localhost:%d", port)
 
-			return true
-		}
-	}
-
-	if _, err := addCustomRule(engDir, v, cloakFiction(v)); err != nil {
+	if _, err := addCustomRule(engDir, v, fiction); err != nil {
 		logger.Warn("could not cloak a residual value", "value", v, "error", err)
 
 		return false
@@ -903,15 +896,4 @@ func cloakOneResidual(engDir, v string) bool {
 	logger.Info("cloaked a residual value", "value", v)
 
 	return true
-}
-
-// cloakFiction builds a deterministic, opaque fiction for a value the mapper
-// could not place. The ".local" suffix has no public TLD and the label is a
-// hash, so the leak check never reads it as a real target and it holds no
-// other mapped value -- the two ways checkTableConflicts would reject it.
-func cloakFiction(v string) string {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(v))
-
-	return fmt.Sprintf("cloaked-%08x.local", h.Sum32())
 }

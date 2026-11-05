@@ -458,24 +458,36 @@ func TestOnLeakPolicyDefaultsToCloak(t *testing.T) {
 	}
 }
 
-// TestCloakFictionIsSafe: the last-resort fiction is deterministic, never
-// holds the real value, and is not itself read as a real target -- the two
-// ways a mapping would make the gate refuse every later body.
-func TestCloakFictionIsSafe(t *testing.T) {
-	for _, real := range []string{"shop.acmetarget.io", "WidgetCorp", "internal"} {
-		fic := cloakFiction(real)
+// TestCloakFictionNotReflaggedAsResidual locks in the permanent fix: the value
+// the cloak produces must be recognised as tanuki's own fiction, so when it
+// comes back in the next request's conversation history it is not read as a
+// fresh real target and re-cloaked forever (which refused the body once the
+// pass bound was hit). A "localhost:<port>" fiction satisfies isOwnFiction; the
+// old ".local" fiction did not.
+func TestCloakFictionNotReflaggedAsResidual(t *testing.T) {
+	engDir := setupEngagement(t, testBaseDomain)
 
-		if fic != cloakFiction(real) {
-			t.Errorf("cloakFiction(%q) is not deterministic", real)
-		}
+	val := "api.devops.acmetarget.de"
 
-		if strings.Contains(fic, real) {
-			t.Errorf("cloakFiction(%q) = %q holds the real value", real, fic)
-		}
+	if n := forceCloakResiduals(engDir, []string{val}); n != 1 {
+		t.Fatalf("forceCloakResiduals cloaked %d, want 1", n)
+	}
 
-		if found := residualTargets(nil, fic); len(found) != 0 {
-			t.Errorf("cloakFiction(%q) = %q looks like a real target: %v", real, fic, found)
-		}
+	proxyCache.invalidate()
+
+	rw, err := proxyCache.rewriterOrError(engDir, directionR2F)
+	if err != nil || rw == nil {
+		t.Fatalf("rewriterOrError: rw=%v err=%v", rw, err)
+	}
+
+	fiction := rw.rewrite(val) // the cloak fiction this value now maps to
+	if fiction == val {
+		t.Fatalf("value was not rewritten at all: %q", fiction)
+	}
+
+	// The fiction, seen in a later body, must not be flagged as a leak.
+	if res := residualValues(rw, rw.survivors(fiction), nil, fiction); len(res) != 0 {
+		t.Errorf("cloak fiction %q re-flagged as residual: %v", fiction, res)
 	}
 }
 
@@ -507,5 +519,33 @@ func TestForceCloakResidualsHidesEveryShape(t *testing.T) {
 		if got := residualValues(rw, rw.survivors(out), nil, out); len(got) != 0 {
 			t.Errorf("after cloaking %q, gate still sees residual: %v", v, got)
 		}
+	}
+}
+
+// TestCloakRuleRemovesGluedValue locks in the fix for the hard-block bug: a
+// domain glued inside a filename ("F52_api.devops.acmetarget.de_VAPT_Report")
+// survived every pass because a host-bounded mapping will not rewrite it when
+// a "_" abuts the hostname, so the request was refused after maxCloakPasses.
+// The cloak uses a custom rule (boundNone), which matches anywhere, so the
+// glued value is replaced and the next pass is clean.
+func TestCloakRuleRemovesGluedValue(t *testing.T) {
+	engDir := setupEngagement(t, testBaseDomain) // a live rewriter
+
+	val := "api.devops.acmetarget.de"
+	glued := "F52_" + val + "_VAPT_Report"
+
+	if n := forceCloakResiduals(engDir, []string{val}); n != 1 {
+		t.Fatalf("forceCloakResiduals cloaked %d, want 1", n)
+	}
+
+	proxyCache.invalidate()
+
+	rw, err := proxyCache.rewriterOrError(engDir, directionR2F)
+	if err != nil || rw == nil {
+		t.Fatalf("rewriterOrError: rw=%v err=%v", rw, err)
+	}
+
+	if out := rw.rewrite(glued); strings.Contains(out, val) {
+		t.Errorf("glued value survived the cloak rule: %q", out)
 	}
 }
