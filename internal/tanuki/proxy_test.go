@@ -437,3 +437,75 @@ func TestRequestEnvelopeIsGated(t *testing.T) {
 		t.Errorf("an ordinary request was refused: %d %s", rec.Code, rec.Body)
 	}
 }
+
+// TestOnLeakPolicyDefaultsToCloak: the proxy hides a value the auto-mapper
+// missed instead of halting the hunt. refuse and warn stay opt-in.
+func TestOnLeakPolicyDefaultsToCloak(t *testing.T) {
+	cases := map[string]string{
+		"":       onLeakCloak,
+		"cloak":  onLeakCloak,
+		"nonerr": onLeakCloak, // an unknown value is the safe default, not warn
+		"refuse": onLeakRefuse,
+		"warn":   onLeakWarn,
+	}
+
+	for env, want := range cases {
+		t.Setenv("TANUKI_ON_LEAK", env)
+
+		if got := onLeakPolicy(); got != want {
+			t.Errorf("TANUKI_ON_LEAK=%q: policy = %q, want %q", env, got, want)
+		}
+	}
+}
+
+// TestCloakFictionIsSafe: the last-resort fiction is deterministic, never
+// holds the real value, and is not itself read as a real target -- the two
+// ways a mapping would make the gate refuse every later body.
+func TestCloakFictionIsSafe(t *testing.T) {
+	for _, real := range []string{"shop.acmetarget.io", "WidgetCorp", "internal"} {
+		fic := cloakFiction(real)
+
+		if fic != cloakFiction(real) {
+			t.Errorf("cloakFiction(%q) is not deterministic", real)
+		}
+
+		if strings.Contains(fic, real) {
+			t.Errorf("cloakFiction(%q) = %q holds the real value", real, fic)
+		}
+
+		if found := residualTargets(nil, fic); len(found) != 0 {
+			t.Errorf("cloakFiction(%q) = %q looks like a real target: %v", real, fic, found)
+		}
+	}
+}
+
+// TestForceCloakResidualsHidesEveryShape: an IP, a domain, and an arbitrary
+// word all get mapped, and none survives a fresh rewrite afterwards.
+func TestForceCloakResidualsHidesEveryShape(t *testing.T) {
+	engDir := setupEngagement(t) // active engagement, zero seeded domains
+
+	residual := []string{"shop.acmetarget.io", "198.51.100.7", "WidgetCorp"}
+
+	if n := forceCloakResiduals(engDir, residual); n != len(residual) {
+		t.Fatalf("forceCloakResiduals cloaked %d, want %d", n, len(residual))
+	}
+
+	proxyCache.invalidate()
+
+	rw, err := proxyCache.rewriterOrError(engDir, directionR2F)
+	if err != nil || rw == nil {
+		t.Fatalf("rewriterOrError: rw=%v err=%v", rw, err)
+	}
+
+	for _, v := range residual {
+		out := rw.rewrite(v)
+
+		if strings.Contains(out, v) {
+			t.Errorf("after cloaking, %q still present in %q", v, out)
+		}
+
+		if got := residualValues(rw, rw.survivors(out), nil, out); len(got) != 0 {
+			t.Errorf("after cloaking %q, gate still sees residual: %v", v, got)
+		}
+	}
+}

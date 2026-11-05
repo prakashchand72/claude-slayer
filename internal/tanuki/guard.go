@@ -13,17 +13,28 @@ import (
 const (
 	onLeakRefuse = "refuse"
 	onLeakWarn   = "warn"
+	onLeakCloak  = "cloak"
 )
 
 // onLeakPolicy reports what to do when anonymization leaves a real value
-// behind. Refusing is the default; warn exists so an operator whose traffic
-// trips a false positive can keep working while it is diagnosed.
+// behind:
+//
+//   - cloak (the default): force-map each surviving value to a collision-proof
+//     fiction and rewrite again, so a value the auto-mapper missed is hidden
+//     rather than halting the hunt. It never forwards a real value.
+//   - refuse: never forward; return a 4xx so the operator maps it by hand.
+//     The old default, kept for a strict pre-submission run.
+//   - warn: forward the body unchanged and only log. Gives up the no-leak
+//     guarantee; for diagnosing a false positive.
 func onLeakPolicy() string {
-	if envOr("TANUKI_ON_LEAK", onLeakRefuse) == onLeakWarn {
+	switch envOr("TANUKI_ON_LEAK", onLeakCloak) {
+	case onLeakWarn:
 		return onLeakWarn
+	case onLeakRefuse:
+		return onLeakRefuse
+	default:
+		return onLeakCloak
 	}
-
-	return onLeakRefuse
 }
 
 // builtinIgnored are never targets, yet Claude Code puts them in the body of

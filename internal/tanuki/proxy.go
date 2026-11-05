@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"maps"
 	"net"
@@ -673,6 +674,12 @@ func jsonResponseRewriter() *rewriter {
 //
 // A JSON body is rewritten string by string, never as raw text: see
 // structuralKeys for what raw rewriting did to the request itself.
+// maxCloakPasses bounds the cloak retry loop. Each pass that cloaks something
+// shrinks the residual set, so a couple of passes clear any realistic body;
+// the bound only stops a pathological value the cloak cannot remove from
+// spinning forever (it falls through to the refuse error instead).
+const maxCloakPasses = 3
+
 func anonymizeUpstreamBody(body []byte) ([]byte, error) {
 	eng := currentEngagement()
 	if eng == "" {
@@ -681,6 +688,48 @@ func anonymizeUpstreamBody(body []byte) ([]byte, error) {
 
 	engDir := engagementDir(eng)
 
+	for pass := 0; ; pass++ {
+		out, residual, err := anonymizeOnce(engDir, body)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(residual) == 0 {
+			return out, nil
+		}
+
+		// The error names counts, never values; the values go to the log the
+		// operator reads with "docker logs tanuki", because the error reaches the
+		// local client, which may fold its text into the next prompt.
+		logger.Warn("real values survived anonymization", "count", len(residual), "values", residual)
+
+		switch onLeakPolicy() {
+		case onLeakWarn:
+			// Forward unchanged: the no-leak guarantee is waived on purpose.
+			return out, nil
+		case onLeakCloak:
+			// Force-map what the auto-mapper missed and rewrite again, so the
+			// hunt is never halted by a value tanuki can hide itself.
+			if pass < maxCloakPasses && forceCloakResiduals(engDir, residual) > 0 {
+				proxyCache.invalidate()
+
+				continue
+			}
+			// Nothing left to cloak (or the bound is hit): refuse rather than leak.
+		}
+
+		return nil, fmt.Errorf(
+			"%d real value(s) would have been sent unanonymized; see the tanuki log "+
+				"(set TANUKI_ON_LEAK=warn to forward anyway)",
+			len(residual),
+		)
+	}
+}
+
+// anonymizeOnce runs one map-then-rewrite pass and returns the rewritten body
+// together with any real values that survived. It never applies the leak
+// policy itself: the caller decides whether to cloak, refuse, or forward.
+func anonymizeOnce(engDir string, body []byte) ([]byte, []string, error) {
 	doc, isJSON := decodeJSON(body)
 
 	texts := []string{string(body)}
@@ -698,26 +747,22 @@ func anonymizeUpstreamBody(body []byte) ([]byte, error) {
 	}
 
 	if err := mapBodyTargets(engDir, texts, extraIgnored); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	rw, err := proxyCache.rewriterOrError(engDir, directionR2F)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read mappings: %w", err)
+		return nil, nil, fmt.Errorf("cannot read mappings: %w", err)
 	}
 
 	if rw == nil {
-		return nil, errors.New("no target mappings configured (run: tanuki add <domain>)")
+		return nil, nil, errors.New("no target mappings configured (run: tanuki add <domain>)")
 	}
 
 	if !isJSON {
 		out := rw.rewrite(string(body))
 
-		if err := checkResidual(rw, rw.survivors(out), extraIgnored, out); err != nil {
-			return nil, err
-		}
-
-		return []byte(out), nil
+		return []byte(out), residualValues(rw, rw.survivors(out), extraIgnored, out), nil
 	}
 
 	// Only the strings the rewrite touched are checked for org and custom
@@ -732,11 +777,14 @@ func anonymizeUpstreamBody(body []byte) ([]byte, error) {
 		return out
 	})
 
-	if err := checkResidual(rw, survived, extraIgnored, jsonStrings(doc)...); err != nil {
-		return nil, err
+	residual := residualValues(rw, survived, extraIgnored, jsonStrings(doc)...)
+
+	encoded, err := encodeJSON(doc)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	return encodeJSON(doc)
+	return encoded, residual, nil
 }
 
 // mapBodyTargets maps anything in the body that has no fiction yet. Every byte
@@ -760,21 +808,29 @@ func mapBodyTargets(engDir string, texts, extraIgnored []string) error {
 	return nil
 }
 
-// checkResidual is the fail-closed gate. Detection runs before the rewrite, so
-// in a working pipeline nothing real is left; if something is, the rewriter
-// missed it and the body must not go upstream. survived holds the mapped org
+// residualValues reports the real values still present after a rewrite.
+// Detection runs before the rewrite, so in a working pipeline nothing real is
+// left; if something is, the rewriter missed it. survived holds the mapped org
 // names and custom-rule values the rewrite left behind (see survivors); texts
 // are scanned for real-looking domains and IPs.
+func residualValues(rw *rewriter, survived, extraIgnored []string, texts ...string) []string {
+	slices.Sort(survived)
+
+	found := slices.DeleteFunc(residualTargets(extraIgnored, texts...), rw.isOwnFiction)
+
+	return slices.Concat(found, slices.Compact(survived))
+}
+
+// checkResidual is the fail-closed gate used by the tooling and tests: it
+// reports an error when a real value survived, unless the policy is warn. The
+// proxy path applies the policy itself (see anonymizeUpstreamBody) so it can
+// cloak before refusing.
 //
 // The error names counts, never values. It is returned to the local client,
 // which may fold the text into its next prompt, so the values go to the log
 // the operator can read with "docker logs tanuki" instead.
 func checkResidual(rw *rewriter, survived, extraIgnored []string, texts ...string) error {
-	slices.Sort(survived)
-
-	found := slices.DeleteFunc(residualTargets(extraIgnored, texts...), rw.isOwnFiction)
-
-	residual := slices.Concat(found, slices.Compact(survived))
+	residual := residualValues(rw, survived, extraIgnored, texts...)
 	if len(residual) == 0 {
 		return nil
 	}
@@ -793,4 +849,69 @@ func checkResidual(rw *rewriter, survived, extraIgnored []string, texts ...strin
 			"(set TANUKI_ON_LEAK=warn to forward anyway)",
 		len(residual),
 	)
+}
+
+// forceCloakResiduals maps each real value that survived the rewrite to a
+// collision-proof fiction, so the next pass can hide it. It returns how many
+// it mapped; zero means nothing new could be cloaked and the caller must
+// refuse rather than leak.
+func forceCloakResiduals(engDir string, residual []string) int {
+	cloaked := 0
+
+	for _, v := range residual {
+		if cloakOneResidual(engDir, v) {
+			cloaked++
+		}
+	}
+
+	return cloaked
+}
+
+// cloakOneResidual hides a single surviving value. An IP gets a loopback
+// fiction and a domain a hostname-only mapping (a numeric "localhost:<port>"
+// fiction with no org/email/path derivatives, so it cannot collide with an
+// existing org fiction -- the collision that makes the full mapping fail).
+// Anything else, or a domain whose hostname mapping is still refused, gets a
+// literal custom rule to an opaque fiction that no detector flags.
+func cloakOneResidual(engDir, v string) bool {
+	if net.ParseIP(v) != nil {
+		if err := addIPMapping(engDir, v); err != nil {
+			logger.Warn("could not cloak a residual IP", "value", v, "error", err)
+
+			return false
+		}
+
+		logger.Info("cloaked a residual value", "value", v)
+
+		return true
+	}
+
+	if _, err := registrableName(v); err == nil {
+		if err := addHostOnlyDomain(engDir, v); err == nil {
+			logger.Info("cloaked a residual value", "value", v)
+
+			return true
+		}
+	}
+
+	if _, err := addCustomRule(engDir, v, cloakFiction(v)); err != nil {
+		logger.Warn("could not cloak a residual value", "value", v, "error", err)
+
+		return false
+	}
+
+	logger.Info("cloaked a residual value", "value", v)
+
+	return true
+}
+
+// cloakFiction builds a deterministic, opaque fiction for a value the mapper
+// could not place. The ".local" suffix has no public TLD and the label is a
+// hash, so the leak check never reads it as a real target and it holds no
+// other mapped value -- the two ways checkTableConflicts would reject it.
+func cloakFiction(v string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(v))
+
+	return fmt.Sprintf("cloaked-%08x.local", h.Sum32())
 }
