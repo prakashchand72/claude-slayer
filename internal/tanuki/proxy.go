@@ -707,14 +707,27 @@ func anonymizeUpstreamBody(body []byte) ([]byte, error) {
 			// Forward unchanged: the no-leak guarantee is waived on purpose.
 			return out, nil
 		case onLeakCloak:
-			// Force-map what the auto-mapper missed and rewrite again, so the
-			// hunt is never halted by a value tanuki can hide itself.
+			// Force-map what the auto-mapper missed and rewrite again, so a
+			// value that can be cloaked reversibly is hidden cleanly.
 			if pass < maxCloakPasses && forceCloakResiduals(engDir, residual) > 0 {
 				proxyCache.invalidate()
 
 				continue
 			}
-			// Nothing left to cloak (or the bound is hit): refuse rather than leak.
+
+			// The staged rewrite cannot clear these (a later stage regenerates
+			// them). Substitute them directly on the output so the hunt is never
+			// blocked by a value tanuki itself detected leaving.
+			swept, serr := cloakSweep(engDir, out, residual)
+			if serr != nil {
+				logger.Warn("could not sweep residuals; refusing", "error", serr)
+
+				break
+			}
+
+			logger.Info("cloaked residuals by direct substitution", "count", len(residual))
+
+			return swept, nil
 		}
 
 		return nil, fmt.Errorf(
@@ -878,16 +891,7 @@ func forceCloakResiduals(engDir string, residual []string) int {
 // a domain wedged inside a filename like "F52_api.target.de_report", which a
 // host-bounded mapping refuses to touch.
 func cloakOneResidual(engDir, v string) bool {
-	port, err := allocatePort(engDir, "cloak residual")
-	if err != nil {
-		logger.Warn("could not allocate a cloak fiction", "value", v, "error", err)
-
-		return false
-	}
-
-	fiction := fmt.Sprintf("localhost:%d", port)
-
-	if _, err := addCustomRule(engDir, v, fiction); err != nil {
+	if _, err := cloakFictionFor(engDir, v); err != nil {
 		logger.Warn("could not cloak a residual value", "value", v, "error", err)
 
 		return false
@@ -896,4 +900,72 @@ func cloakOneResidual(engDir, v string) bool {
 	logger.Info("cloaked a residual value", "value", v)
 
 	return true
+}
+
+// cloakFictionFor returns the "localhost:<port>" fiction a residual value is
+// cloaked to, reusing the custom rule if one already exists and minting one
+// otherwise. A fresh port keeps the fiction collision-proof, and the custom
+// rule is what reverses the fiction back to the value on the response path.
+func cloakFictionFor(engDir, v string) (string, error) {
+	for _, m := range loadMappings(engDir) {
+		if m.Type == mapCustom && strings.EqualFold(m.Real, v) {
+			return m.Fiction, nil
+		}
+	}
+
+	port, err := allocatePort(engDir, "cloak residual")
+	if err != nil {
+		return "", err
+	}
+
+	fiction := fmt.Sprintf("localhost:%d", port)
+
+	if _, err := addCustomRule(engDir, v, fiction); err != nil {
+		return "", err
+	}
+
+	return fiction, nil
+}
+
+// cloakSweep is the guarantee that a hunt is never blocked: it removes every
+// residual the staged rewrite could not clear by substituting it directly in
+// the output with its reversible cloak fiction.
+//
+// The staged pipeline cannot always clear a residual by re-running, because a
+// later stage regenerates it: an org rewrite turns a glued "api.realorg.de"
+// (a hostname the host-bounded domain pass declined because it runs on into a
+// filename) into "api.<fictionorg>.de", which reads as a real domain and which
+// no earlier custom-rule stage can catch. Matching the detected value on the
+// final output with a boundNone machine -- the same case-insensitive matcher
+// the rewrite uses -- replaces it wherever it ended up. The replacement is a
+// "localhost:<port>" fiction, so it is tanuki's own output and never re-flags.
+func cloakSweep(engDir string, out []byte, residual []string) ([]byte, error) {
+	var patterns, replacements []string
+
+	var bounds []boundKind
+
+	for _, v := range residual {
+		fiction, err := cloakFictionFor(engDir, v)
+		if err != nil {
+			return out, err
+		}
+
+		patterns = append(patterns, v)
+		replacements = append(replacements, fiction)
+		bounds = append(bounds, boundNone)
+	}
+
+	m := newACMachine(patterns, replacements, bounds)
+	if m == nil {
+		return out, nil
+	}
+
+	doc, isJSON := decodeJSON(out)
+	if !isJSON {
+		return []byte(m.replaceAll(string(out))), nil
+	}
+
+	doc = rewriteJSONStrings(doc, m.replaceAll)
+
+	return encodeJSON(doc)
 }

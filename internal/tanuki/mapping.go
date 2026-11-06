@@ -267,7 +267,23 @@ func newRewriterEscaping(mappings []mappingEntry, direction string, escape func(
 	// and therefore wins, is the table's order rather than chance.
 	sort.SliceStable(sorted, func(i, j int) bool {
 		if direction == directionR2F {
-			return len(sorted[i].Real) > len(sorted[j].Real)
+			if len(sorted[i].Real) != len(sorted[j].Real) {
+				return len(sorted[i].Real) > len(sorted[j].Real)
+			}
+
+			// Same real string, different rules: a match-anywhere rule
+			// (boundNone, e.g. a cloak custom rule) must win the shared
+			// automaton node over a host-bounded domain/email rule. The trie
+			// keeps one entry per identical string and the last insert wins, so
+			// sort the looser bound last. Without this, a value glued to other
+			// text -- a domain inside "..._VAPT_Report" -- keeps its host bound,
+			// which the continuation check rejects, so the cloak rule never
+			// fires and the gate refuses the body for good.
+			if sorted[i].Real == sorted[j].Real {
+				return boundRank(mappingBound(sorted[i].Type)) < boundRank(mappingBound(sorted[j].Type))
+			}
+
+			return false
 		}
 
 		return len(sorted[i].Fiction) > len(sorted[j].Fiction)
@@ -393,6 +409,20 @@ func mappingBound(typ string) boundKind {
 	}
 
 	return boundNone
+}
+
+// boundRank orders bounds from tightest (0) to loosest, so a sort can place a
+// match-anywhere rule last and let it win a trie node it shares with a
+// host-bounded rule for the same string. boundNone matches everywhere a
+// host-bounded rule does and more, so when both exist for one value the
+// looser rule is the safe winner: it still hides the value when it stands
+// alone and also when it is glued to other text.
+func boundRank(b boundKind) int {
+	if b == boundNone {
+		return 1
+	}
+
+	return 0
 }
 
 // reservedOrgNames are never spent on an org rule by auto-detection. An org
