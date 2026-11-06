@@ -1,3 +1,31 @@
+# Claude Slayer
+
+Run **Claude Code** on a confidential security engagement without the target's
+real identifiers ever reaching the API. A local proxy rewrites domains, IPs, org
+names, emails and paths to fiction on the way out and restores them on the way
+back - and it never hard-blocks a hunt.
+
+```sh
+git clone https://github.com/prakashchand72/claude-slayer
+cd claude-slayer
+./claude-slayer '*.example.com'     # start proxy, register target, launch Claude
+```
+
+| Command | What it does |
+| --- | --- |
+| `./claude-slayer example.com` | Start proxy, register target (+ all subdomains), launch Claude. |
+| `./claude-slayer stop` | Stop the proxy, keep mappings. |
+| `./claude-slayer reset [domain]` | Wipe all data, optionally register a fresh target. |
+
+**Full guide: [CLAUDE-SLAYER.md](CLAUDE-SLAYER.md).** It is an anonymization tool,
+not a safety bypass; only use it on targets you are authorized to test.
+
+Claude Slayer is a fork of [tanuki](https://github.com/Pigyon/tanuki) (Apache-2.0)
+with a never-block cloak policy and a self-contained source build. The original
+tanuki documentation follows.
+
+---
+
 <div align="center">
 
 # Tanuki
