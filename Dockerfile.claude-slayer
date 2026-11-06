@@ -1,0 +1,18 @@
+# Self-contained build for claude-slayer: compiles the patched proxy from
+# source inside Docker, so no Go toolchain, no buildx and no prebuilt image
+# are needed. Plain "docker build" works on any Docker engine.
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=claude-slayer
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags "-s -w -X github.com/Pigyon/tanuki/internal/tanuki.version=${VERSION}" \
+    -o /slayer ./cmd/tanuki
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=build /slayer /tanuki
+ENTRYPOINT ["/tanuki"]
+CMD ["proxy"]

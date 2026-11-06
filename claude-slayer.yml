@@ -1,0 +1,26 @@
+# claude-slayer: self-contained proxy service. Builds the patched image from
+# source on first "up", binds the proxy to localhost only, and keeps all
+# mappings in a named volume so they survive a restart.
+services:
+  tanuki:
+    build:
+      context: .
+      dockerfile: Dockerfile.claude-slayer
+    image: claude-slayer:local
+    container_name: claude-slayer
+    ports:
+      - "127.0.0.1:18080:18080"
+    volumes:
+      - claude-slayer-data:/data
+      - ./.claude:/workspace/.claude
+    working_dir: /workspace
+    environment:
+      - TANUKI_DATA=/data
+      - TANUKI_PROXY_PORT=18080
+      - TANUKI_UPSTREAM=https://api.anthropic.com
+      - TANUKI_UID=${TANUKI_UID:-1000}
+      - TANUKI_GID=${TANUKI_GID:-1000}
+      # Never hard-block a hunt: cloak an unmapped value instead of refusing.
+      - TANUKI_ON_LEAK=cloak
+volumes:
+  claude-slayer-data:

@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+#
+# claude-slayer - run Claude Code on a confidential engagement without the
+# target's real identifiers (domains, IPs, org names, emails, paths) ever
+# reaching the API. A local proxy rewrites them to fiction on the way out and
+# back on the way in, so you keep working with the real values and the upstream
+# never sees them.
+#
+# Usage:
+#   ./claude-slayer '*.example.com'   start the proxy, register the target
+#                                     (and all its subdomains), launch Claude
+#   ./claude-slayer example.com       same - the "*." is optional
+#   ./claude-slayer stop              stop the proxy (your mappings are kept)
+#   ./claude-slayer reset [domain]    wipe ALL data, then optionally register a
+#                                     fresh target and launch
+#   ./claude-slayer build             (re)build the proxy image from source
+#
+set -euo pipefail
+cd "$(dirname "$0")"
+
+COMPOSE="docker compose -f claude-slayer.yml"
+
+say() { printf '\033[36m[claude-slayer]\033[0m %s\n' "$*"; }
+die() { printf '\033[31m[claude-slayer]\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+	sed -n '3,20p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'
+}
+
+# Strip a leading "*.", a scheme and any path, so all of these give example.com:
+#   *.example.com   https://example.com/login   example.com
+clean_domain() {
+	local d="$1"
+	d="${d#\*.}"
+	d="${d#http://}"; d="${d#https://}"
+	d="${d%%/*}"
+	printf '%s' "$d"
+}
+
+engine_up() {
+	command -v docker >/dev/null 2>&1 || die "Docker is not installed."
+	if command -v colima >/dev/null 2>&1 && ! colima status >/dev/null 2>&1; then
+		say "starting Colima..."
+		colima start
+	fi
+}
+
+proxy_up() {
+	say "starting proxy (building the image the first time)..."
+	$COMPOSE up -d >/dev/null
+	printf '\033[36m[claude-slayer]\033[0m waiting for the proxy on 18080'
+	for _ in $(seq 1 60); do
+		if $COMPOSE exec -T tanuki /tanuki status >/dev/null 2>&1; then
+			printf ' ok\n'
+			return 0
+		fi
+		printf '.'
+		sleep 1
+	done
+	printf '\n'
+	die "the proxy did not come up - check: $COMPOSE logs tanuki"
+}
+
+cli() { $COMPOSE exec -T tanuki /tanuki "$@"; }
+
+register() {
+	local dom="$1"
+	say "registering target: $dom  (covers *.$dom)"
+	cli add "$dom"       </dev/null >/dev/null 2>&1 || true
+	cli scope add "$dom" </dev/null >/dev/null 2>&1 || true
+}
+
+launch() {
+	if command -v claude >/dev/null 2>&1; then
+		say "launching Claude Code - hunt away."
+		exec claude
+	fi
+	say "proxy ready and wired via .claude/settings.json. Now run:  claude"
+}
+
+case "${1:-}" in
+	"" | -h | --help)
+		usage
+		;;
+
+	stop)
+		engine_up
+		say "stopping the proxy (mappings kept; use 'reset' to wipe them)"
+		$COMPOSE down >/dev/null 2>&1 || true
+		say "stopped."
+		;;
+
+	reset)
+		engine_up
+		say "wiping ALL engagement data (every mapping, every target)..."
+		$COMPOSE down -v >/dev/null 2>&1 || true
+		proxy_up
+		if [ -n "${2:-}" ]; then
+			dom="$(clean_domain "$2")"
+			register "$dom"
+			say "clean slate + new target: $dom"
+			launch
+		else
+			say "clean slate. add a target with:  ./claude-slayer <domain>"
+		fi
+		;;
+
+	build)
+		engine_up
+		say "building the proxy image from source..."
+		$COMPOSE build
+		say "built: claude-slayer:local"
+		;;
+
+	*)
+		dom="$(clean_domain "$1")"
+		[ -n "$dom" ] || die "give a target, e.g.  ./claude-slayer example.com"
+		engine_up
+		proxy_up
+		register "$dom"
+		launch
+		;;
+esac
